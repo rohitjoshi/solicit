@@ -46,7 +46,7 @@ use http::{HttpScheme, ALPN_PROTOCOLS};
 use super::{ClientStream, write_preface, HttpConnect, HttpConnectError};
 
 use openssl::ssl::{Ssl, SslStream, SslContext};
-use openssl::ssl::{SSL_VERIFY_PEER, SSL_VERIFY_FAIL_IF_NO_PEER_CERT};
+use openssl::ssl::{SSL_VERIFY_PEER, SSL_VERIFY_NONE, SSL_VERIFY_FAIL_IF_NO_PEER_CERT};
 use openssl::ssl::SSL_OP_NO_COMPRESSION;
 use openssl::ssl::error::SslError;
 use openssl::ssl::SslMethod;
@@ -203,12 +203,16 @@ impl<'a, 'ctx> TlsConnector<'a, 'ctx> {
 
     /// Builds up a default `SslContext` instance wth TLS settings that the
     /// HTTP/2 spec mandates. The path to the CA file needs to be provided.
-    pub fn build_default_context(ca_file_path: &Path) -> Result<SslContext, TlsConnectError> {
+    pub fn build_default_context(ca_file_path: &Path, verify_peer : bool) -> Result<SslContext, TlsConnectError> {
         // HTTP/2 connections need to be on top of TLSv1.2 or newer.
         let mut context = try!(SslContext::new(SslMethod::Tlsv1_2));
 
         // This makes the certificate required (only VERIFY_PEER would mean optional)
-        context.set_verify(SSL_VERIFY_PEER , None);
+        if verify_peer == true {
+            context.set_verify(SSL_VERIFY_PEER |SSL_VERIFY_FAIL_IF_NO_PEER_CERT, None);
+        }else {
+            context.set_verify(SSL_VERIFY_NONE, None);
+        }
         try!(context.set_CA_file(ca_file_path));
         // Compression is not allowed by the spec
         context.set_options(SSL_OP_NO_COMPRESSION);
@@ -230,7 +234,7 @@ impl<'a, 'ctx> HttpConnect for TlsConnector<'a, 'ctx> {
         // used...
         let ssl = match self.context {
             Http2TlsContext::CertPath(path) => {
-                let ctx = try!(TlsConnector::build_default_context(&path));
+                let ctx = try!(TlsConnector::build_default_context(&path, true));
                 try!(Ssl::new(&ctx))
             }
             Http2TlsContext::Wrapped(ctx) => try!(Ssl::new(ctx)),
