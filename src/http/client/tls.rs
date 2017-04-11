@@ -205,7 +205,7 @@ impl<'a, 'ctx> TlsConnector<'a, 'ctx> {
         let mut context = try!(SslContext::new(SslMethod::Tlsv1_2));
 
         // This makes the certificate required (only VERIFY_PEER would mean optional)
-        context.set_verify(SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, None);
+        context.set_verify(SSL_VERIFY_PEER , None);
         try!(context.set_CA_file(ca_file_path));
         // Compression is not allowed by the spec
         context.set_options(SSL_OP_NO_COMPRESSION);
