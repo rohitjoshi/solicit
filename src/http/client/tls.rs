@@ -16,7 +16,7 @@
 //!
 //! // Connect to an HTTP/2 aware server
 //! let path = "/path/to/certs.pem";
-//! let connector = TlsConnector::new("http2bin.org", &path);
+//! let connector = TlsConnector::new("http2bin.org", 443, &path);
 //! let mut client = SimpleClient::with_connector(connector).unwrap();
 //! let response = client.get(b"/get", &[]).unwrap();
 //! assert_eq!(response.stream_id, 1);
@@ -66,7 +66,7 @@ use openssl::ssl::SslMethod;
 ///
 /// // Connect to an HTTP/2 aware server
 /// let path = "/path/to/certs.pem";
-/// let connector = TlsConnector::new("http2bin.org", &path);
+/// let connector = TlsConnector::new("http2bin.org", 443, &path);
 /// let mut client = SimpleClient::with_connector(connector).unwrap();
 /// let response = client.get(b"/get", &[]).unwrap();
 /// assert_eq!(response.stream_id, 1);
@@ -85,6 +85,7 @@ use openssl::ssl::SslMethod;
 /// ```
 pub struct TlsConnector<'a, 'ctx> {
     pub host: &'a str,
+    pub port: u16,
     context: Http2TlsContext<'ctx>,
 }
 
@@ -182,18 +183,20 @@ impl<'a, 'ctx> TlsConnector<'a, 'ctx> {
     /// Creates a new `TlsConnector` that will create a new `SslContext` before
     /// trying to establish the TLS connection. The path to the CA file that the
     /// context will use needs to be provided.
-    pub fn new<P: AsRef<Path>>(host: &'a str, ca_file_path: &'ctx P) -> TlsConnector<'a, 'ctx> {
+    pub fn new<P: AsRef<Path>>(host: &'a str, port:u16, ca_file_path: &'ctx P) -> TlsConnector<'a, 'ctx> {
         TlsConnector {
             host: host,
+            port: port,
             context: Http2TlsContext::CertPath(ca_file_path.as_ref()),
         }
     }
 
     /// Creates a new `TlsConnector` that will use the provided context to
     /// create the `SslStream` that will back the HTTP/2 connection.
-    pub fn with_context(host: &'a str, context: &'ctx SslContext) -> TlsConnector<'a, 'ctx> {
+    pub fn with_context(host: &'a str, port:u16, context: &'ctx SslContext) -> TlsConnector<'a, 'ctx> {
         TlsConnector {
             host: host,
+            port: port,
             context: Http2TlsContext::Wrapped(context),
         }
     }
@@ -222,7 +225,7 @@ impl<'a, 'ctx> HttpConnect for TlsConnector<'a, 'ctx> {
 
     fn connect(self) -> Result<ClientStream<SslStream<TcpStream>>, TlsConnectError> {
         // First, create a TCP connection to port 443
-        let raw_tcp = try!(TcpStream::connect(&(self.host, 443)));
+        let raw_tcp = try!(TcpStream::connect(&(self.host, self.port)));
         // Now build the SSL instance, depending on which SSL context should be
         // used...
         let ssl = match self.context {
