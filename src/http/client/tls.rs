@@ -240,7 +240,7 @@ impl<'a, 'ctx> HttpConnect for TlsConnector<'a, 'ctx> {
         // used...
         let ssl = match self.context {
             Http2TlsContext::CertPath(path) => {
-                let ctx = try!(TlsConnector::build_default_context(&path, true));
+                let ctx = try!(TlsConnector::build_default_context(&path, true, None, None));
                 try!(Ssl::new(&ctx))
             }
             Http2TlsContext::Wrapped(ctx) => try!(Ssl::new(ctx)),
