@@ -203,7 +203,7 @@ impl<'a, 'ctx> TlsConnector<'a, 'ctx> {
 
     /// Builds up a default `SslContext` instance wth TLS settings that the
     /// HTTP/2 spec mandates. The path to the CA file needs to be provided.
-    pub fn build_default_context(ca_file_path: &Path, verify_peer : bool) -> Result<SslContext, TlsConnectError> {
+    pub fn build_default_context(ca_file_path: &Path, verify_peer : bool, cert_file: &Option<Path>, private_key: &Option<Path>) -> Result<SslContext, TlsConnectError> {
         // HTTP/2 connections need to be on top of TLSv1.2 or newer.
         let mut context = try!(SslContext::new(SslMethod::Tlsv1_2));
 
@@ -214,6 +214,12 @@ impl<'a, 'ctx> TlsConnector<'a, 'ctx> {
             context.set_verify(SSL_VERIFY_NONE, None);
         }
         try!(context.set_CA_file(ca_file_path));
+        if cert_file.is_some() {
+            try!(context.set_certificate_file(cert_file.unwrap()));
+        }
+        if private_key.is_some() {
+            try!(context.set_private_key_file(private_key.unwrap()));
+        }
         // Compression is not allowed by the spec
         context.set_options(SSL_OP_NO_COMPRESSION);
         // The HTTP/2 protocol identifiers are constant at the library level...
