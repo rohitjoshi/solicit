@@ -203,7 +203,7 @@ impl<'a, 'ctx> TlsConnector<'a, 'ctx> {
 
     /// Builds up a default `SslContext` instance wth TLS settings that the
     /// HTTP/2 spec mandates. The path to the CA file needs to be provided.
-    pub fn build_default_context(ca_file_path: &Path, verify_peer : bool, cert_file: &Option<Path>, private_key: &Option<Path>) -> Result<SslContext, TlsConnectError> {
+    pub fn build_default_context(ca_file_path: &Path, verify_peer : bool, cert_file: Option<Path>, private_key: Option<Path>) -> Result<SslContext, TlsConnectError> {
         // HTTP/2 connections need to be on top of TLSv1.2 or newer.
         let mut context = try!(SslContext::new(SslMethod::Tlsv1_2));
 
