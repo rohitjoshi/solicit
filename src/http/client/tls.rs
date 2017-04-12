@@ -36,7 +36,7 @@
 
 use std::convert::AsRef;
 use std::net::TcpStream;
-use std::path::Path;
+use std::path::{Path,PathBuf};
 use std::error;
 use std::fmt;
 use std::str;
@@ -50,6 +50,7 @@ use openssl::ssl::{SSL_VERIFY_PEER, SSL_VERIFY_NONE, SSL_VERIFY_FAIL_IF_NO_PEER_
 use openssl::ssl::SSL_OP_NO_COMPRESSION;
 use openssl::ssl::error::SslError;
 use openssl::ssl::SslMethod;
+use openssl::x509::X509FileType;
 
 /// A struct implementing the functionality of establishing a TLS-backed TCP stream
 /// that can be used by an HTTP/2 connection. Takes care to set all the TLS options
@@ -203,7 +204,7 @@ impl<'a, 'ctx> TlsConnector<'a, 'ctx> {
 
     /// Builds up a default `SslContext` instance wth TLS settings that the
     /// HTTP/2 spec mandates. The path to the CA file needs to be provided.
-    pub fn build_default_context(ca_file_path: &Path, verify_peer : bool, cert_file: Option<Path>, private_key: Option<Path>) -> Result<SslContext, TlsConnectError> {
+    pub fn build_default_context(ca_file_path: &Path, verify_peer : bool, cert_file: Option<PathBuf>, private_key: Option<PathBuf>) -> Result<SslContext, TlsConnectError> {
         // HTTP/2 connections need to be on top of TLSv1.2 or newer.
         let mut context = try!(SslContext::new(SslMethod::Tlsv1_2));
 
@@ -215,10 +216,10 @@ impl<'a, 'ctx> TlsConnector<'a, 'ctx> {
         }
         try!(context.set_CA_file(ca_file_path));
         if cert_file.is_some() {
-            try!(context.set_certificate_file(cert_file.unwrap()));
+            try!(context.set_certificate_file(cert_file.unwrap(),X509FileType::PEM));
         }
         if private_key.is_some() {
-            try!(context.set_private_key_file(private_key.unwrap()));
+            try!(context.set_private_key_file(private_key.unwrap(),X509FileType::PEM));
         }
         // Compression is not allowed by the spec
         context.set_options(SSL_OP_NO_COMPRESSION);
