@@ -204,9 +204,28 @@ impl<'a, 'ctx> TlsConnector<'a, 'ctx> {
 
     /// Builds up a default `SslContext` instance wth TLS settings that the
     /// HTTP/2 spec mandates. The path to the CA file needs to be provided.
-    pub fn build_default_context(ca_file_path: &Path, verify_peer : bool, cert_file: Option<PathBuf>, private_key: Option<PathBuf>) -> Result<SslContext, TlsConnectError> {
+    pub fn build_default_context(ca_file_path: &Path) -> Result<SslContext, TlsConnectError> {
         // HTTP/2 connections need to be on top of TLSv1.2 or newer.
         let mut context = try!(SslContext::new(SslMethod::Tlsv1_2));
+
+        // This makes the certificate required (only VERIFY_PEER would mean optional)
+        context.set_verify(SSL_VERIFY_PEER |SSL_VERIFY_FAIL_IF_NO_PEER_CERT, None);
+        
+        try!(context.set_CA_file(ca_file_path));
+        
+        // Compression is not allowed by the spec
+        context.set_options(SSL_OP_NO_COMPRESSION);
+        // The HTTP/2 protocol identifiers are constant at the library level...
+        context.set_npn_protocols(ALPN_PROTOCOLS);
+
+        Ok(context)
+    }
+
+    /// Builds up a  `SslContext` instance wth TLS settings that the
+    /// HTTP/2 spec mandates. The path to the CA file needs to be provided.
+    pub fn build_context(ssl_method: Option<SslMethod>, ca_file_path: Option<PathBuf>, verify_peer : bool, cert_file_path: Option<PathBuf>, private_key_file_path: Option<PathBuf>) -> Result<SslContext, TlsConnectError> {
+        // HTTP/2 connections need to be on top of TLSv1.2 or newer.
+        let mut context = try!(SslContext::new(ssl_method.unwrap_or(SslMethod::Tlsv1_2)));
 
         // This makes the certificate required (only VERIFY_PEER would mean optional)
         if verify_peer == true {
@@ -214,12 +233,17 @@ impl<'a, 'ctx> TlsConnector<'a, 'ctx> {
         }else {
             context.set_verify(SSL_VERIFY_NONE, None);
         }
-        try!(context.set_CA_file(ca_file_path));
-        if cert_file.is_some() {
-            try!(context.set_certificate_file(cert_file.unwrap(),X509FileType::PEM));
+        // set the CA file
+        if ca_file_path.is_some() {
+            try!(context.set_CA_file(ca_file_path.unwrap()));
         }
-        if private_key.is_some() {
-            try!(context.set_private_key_file(private_key.unwrap(),X509FileType::PEM));
+        // set the client cert
+        if cert_file_path.is_some() {
+            try!(context.set_certificate_file(cert_file_path.unwrap(),X509FileType::PEM));
+        }
+        //set the  private key
+        if private_key_file_path.is_some() {
+            try!(context.set_private_key_file(private_key_file_path.unwrap(),X509FileType::PEM));
         }
         // Compression is not allowed by the spec
         context.set_options(SSL_OP_NO_COMPRESSION);
@@ -241,7 +265,7 @@ impl<'a, 'ctx> HttpConnect for TlsConnector<'a, 'ctx> {
         // used...
         let ssl = match self.context {
             Http2TlsContext::CertPath(path) => {
-                let ctx = try!(TlsConnector::build_default_context(&path, true, None, None));
+                let ctx = try!(TlsConnector::build_default_context(&path));
                 try!(Ssl::new(&ctx))
             }
             Http2TlsContext::Wrapped(ctx) => try!(Ssl::new(ctx)),
