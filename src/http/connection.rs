@@ -274,8 +274,31 @@ impl<'a, S> HttpConnectionSender<'a, S>
         }
         // Adjust the flow control window...
         try!(self.conn.decrease_out_window(frame.payload_len()));
-        trace!("New OUT WINDOW size = {}", self.conn.out_window_size());
+        trace!("New OUT WINDOW size = {:?}", self.conn.out_window_size());
         // ...and now send it out.
+        self.send_frame(frame)
+    }
+
+    /// Sends a window update frame for the peer's connection level flow control window.
+    pub fn send_connection_window_update(&mut self, increment: u32) -> HttpResult<()> {
+        if increment == 0 {
+            warn!("Tried to increase window by zero, which would be invalid; frame not sent.");
+            return Ok(());
+        }
+        let frame = WindowUpdateFrame::for_connection(increment);
+        self.send_frame(frame)
+    }
+
+    /// Sends a window update frame for the given stream's flow control window.
+    pub fn send_stream_window_update(&mut self,
+                                     stream_id: StreamId,
+                                     increment: u32)
+                                     -> HttpResult<()> {
+        if increment == 0 {
+            warn!("Tried to increase window by zero, which would be invalid; frame not sent.");
+            return Ok(());
+        }
+        let frame = WindowUpdateFrame::for_stream(stream_id, increment);
         self.send_frame(frame)
     }
 
@@ -352,13 +375,23 @@ impl HttpConnection {
 
     /// Returns the current size of the inbound flow control window (i.e. the number of octets that
     /// the connection will accept and the peer will send at most, unless the window is updated).
-    pub fn in_window_size(&self) -> i32 {
-        self.in_window_size.size()
+    pub fn in_window_size(&self) -> WindowSize {
+        self.in_window_size
     }
+
     /// Returns the current size of the outbound flow control window (i.e. the number of octets
     /// that can be sent on the connection to the peer without violating flow control).
-    pub fn out_window_size(&self) -> i32 {
-        self.out_window_size.size()
+    pub fn out_window_size(&self) -> WindowSize {
+        self.out_window_size
+    }
+
+    /// Increases the size of the inbound connection flow control window by the given delta.
+    ///
+    /// If this would cause the window to overflow the maximum value of 2^31 - 1, returns an error.
+    /// The method **does not** automatically send any window update frames. It is the caller's
+    /// responsibility to make sure that the peer is notified of the window increase.
+    pub fn increase_connection_window_size(&mut self, delta: u32) -> HttpResult<()> {
+        self.in_window_size.try_increase(delta).map_err(|_| HttpError::WindowSizeOverflow)
     }
 
     /// The method processes the next frame provided by the given `ReceiveFrame` instance, expecting
@@ -452,9 +485,9 @@ impl HttpConnection {
                                   frame.debug_data(),
                                   self)
             }
-            HttpFrame::WindowUpdateFrame(_) => {
+            HttpFrame::WindowUpdateFrame(frame) => {
                 debug!("WINDOW_UPDATE frame received");
-                Ok(())
+                self.handle_window_update(frame, session)
             }
             HttpFrame::UnknownFrame(frame) => {
                 debug!("Unknown frame received; raw = {:?}", frame);
@@ -471,13 +504,19 @@ impl HttpConnection {
                                         frame: DataFrame,
                                         session: &mut Sess)
                                         -> HttpResult<()> {
+        // Decrease the connection inbound window...
         try!(self.decrease_in_window(frame.payload_len()));
-        trace!("New IN WINDOW size = {}", self.in_window_size());
+        trace!("New IN WINDOW size = {:?}", self.in_window_size());
+        try!(session.on_connection_in_window_decrease(self));
+
+        // ...as well as the stream's...
+        try!(session.on_stream_in_window_decrease(
+                frame.get_stream_id(),
+                frame.payload_len(),
+                self));
+
+        // ...before passing off the actual data chunk to the session.
         try!(session.new_data_chunk(frame.get_stream_id(), &frame.data, self));
-        // TODO(mlalic): Should the connection separately signal the decrease in the flow control
-        //               window? For now, it is expected that the data callback is enough, as the
-        //               session would be able to inspect the new window size there (and know that
-        //               it was affected by the data already).
 
         if frame.is_set(DataFlag::EndStream) {
             debug!("End of stream {}", frame.get_stream_id());
@@ -532,9 +571,28 @@ impl HttpConnection {
                                             -> HttpResult<()> {
         if !frame.is_ack() {
             // TODO: Actually handle the settings change before sending out the ACK
-            //       sending out the ACK.
             trace!("New settings frame {:#?}", frame);
             try!(session.new_settings(frame.settings, self));
+        }
+
+        Ok(())
+    }
+
+    /// Private helper method that handles an incoming `WindowUpdateFrame`.
+    fn handle_window_update<Sess: Session>(&mut self,
+                                           frame: WindowUpdateFrame,
+                                           session: &mut Sess)
+                                           -> HttpResult<()> {
+        if frame.get_stream_id() == 0 {
+            // TODO: If overflow does occur, notify the session so that it can try to send a
+            //       GOAWAY before tearing down the connection.
+            try!(self.out_window_size.try_increase(frame.increment())
+                                     .map_err(|_| HttpError::WindowSizeOverflow));
+            try!(session.on_connection_out_window_update(self));
+        } else {
+            try!(session.on_stream_out_window_update(frame.get_stream_id(),
+                                                     frame.increment(),
+                                                     self));
         }
 
         Ok(())
@@ -564,6 +622,17 @@ impl HttpConnection {
     }
 }
 
+/// A helper method for tests that allows the window sizes of the given connection to be modified.
+/// Since this touches the internal state that isn't intended to be modified by clients directly,
+/// it is intended only as a helper for tests.
+#[cfg(test)]
+pub fn set_connection_windows(conn: &mut HttpConnection,
+                              in_window: WindowSize,
+                              out_window: WindowSize) {
+    conn.in_window_size = in_window;
+    conn.out_window_size = out_window;
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -574,8 +643,8 @@ mod tests {
     use http::tests::common::{build_mock_http_conn, StubDataPrioritizer, TestSession,
                               MockReceiveFrame, MockSendFrame};
     use http::frame::{Frame, DataFrame, HeadersFrame, RstStreamFrame, GoawayFrame, SettingsFrame,
-                      PingFrame, pack_header, RawFrame, FrameIR};
-    use http::{HttpResult, HttpScheme, Header, OwnedHeader, ErrorCode};
+                      WindowUpdateFrame, PingFrame, pack_header, RawFrame, FrameIR};
+    use http::{HttpResult, HttpError, HttpScheme, Header, OwnedHeader, ErrorCode};
     use hpack;
 
     /// A helper function that performs a `send_frame` operation on the given
@@ -890,6 +959,71 @@ mod tests {
         expect_frame_list(expected, sender.sent);
     }
 
+    #[test]
+    fn test_send_connection_window_update_non_zero() {
+        let increment = 100;
+        let expected = vec![
+            HttpFrame::WindowUpdateFrame(WindowUpdateFrame::for_connection(increment)),
+        ];
+
+        let mut conn = build_mock_http_conn();
+        let mut sender = MockSendFrame::new();
+        conn.sender(&mut sender).send_connection_window_update(increment).unwrap();
+
+        expect_frame_list(expected, sender.sent);
+    }
+
+    #[test]
+    fn test_send_connection_window_update_is_zero() {
+        let increment = 0;
+
+        let mut conn = build_mock_http_conn();
+        let mut sender = MockSendFrame::new();
+        conn.sender(&mut sender).send_connection_window_update(increment).unwrap();
+
+        expect_frame_list(vec![], sender.sent);
+    }
+
+    #[test]
+    fn test_send_stream_window_update_non_zero() {
+        let increment = 100;
+        let expected = vec![
+            HttpFrame::WindowUpdateFrame(WindowUpdateFrame::for_stream(1, increment)),
+        ];
+
+        let mut conn = build_mock_http_conn();
+        let mut sender = MockSendFrame::new();
+        conn.sender(&mut sender).send_stream_window_update(1, increment).unwrap();
+
+        expect_frame_list(expected, sender.sent);
+    }
+
+    #[test]
+    fn test_send_stream_window_update_is_zero() {
+        let increment = 0;
+
+        let mut conn = build_mock_http_conn();
+        let mut sender = MockSendFrame::new();
+        conn.sender(&mut sender).send_stream_window_update(1, increment).unwrap();
+
+        expect_frame_list(vec![], sender.sent);
+    }
+
+    #[test]
+    fn test_increase_connection_window() {
+        let mut conn = build_mock_http_conn();
+        assert_eq!(conn.in_window_size(), 0xffff);
+        conn.increase_connection_window_size(500).unwrap();
+        assert_eq!(conn.in_window_size(), 0xffff + 500);
+        conn.increase_connection_window_size(5).unwrap();
+        assert_eq!(conn.in_window_size(), 0xffff + 500 + 5);
+        // Overflow!
+        assert!(match conn.increase_connection_window_size(0x7fffffff).err().unwrap() {
+            HttpError::WindowSizeOverflow => true,
+            _ => false,
+        });
+    }
+
     /// Tests that the `HttpConnection` correctly notifies the session on a
     /// new headers frame, with no continuation.
     #[test]
@@ -924,13 +1058,21 @@ mod tests {
 
         conn.handle_next_frame(&mut frame_provider, &mut session).unwrap();
 
-        // A poor man's mock...
         // The header callback was not called
         assert_eq!(session.curr_header, 0);
         // and exactly one chunk seen.
         assert_eq!(session.curr_chunk, 1);
+        // which caused the stream's window to decrease
+        assert_eq!(session.stream_window_decreases.len(), 1);
+        assert_eq!(session.stream_window_decreases[0], (1, 6));
+
+        // as well as the connection's...
+        let new_conn_in_window = 65_535 - 6;
+        assert_eq!(conn.in_window_size(), new_conn_in_window);
+        // ...which was reported to the session
+        assert_eq!(session.conn_in_window_decreases, vec![new_conn_in_window]);
+
         assert_eq!(session.rst_streams.len(), 0);
-        assert_eq!(conn.in_window_size(), 65_535 - 6);
     }
 
     /// Tests that the session gets the correct values for the headers and data
@@ -943,10 +1085,8 @@ mod tests {
                     hpack::Encoder::new().encode(
                         expected_headers.iter().map(|h| (&h.0[..], &h.1[..]))),
                     1)),
-            HttpFrame::DataFrame(DataFrame::new(1)), {
-                let frame = DataFrame::with_data(1, &b"1234"[..]);
-                HttpFrame::DataFrame(frame)
-            },
+            HttpFrame::DataFrame(DataFrame::new(1)),
+            HttpFrame::DataFrame(DataFrame::with_data(1, &b"1234"[..])),
         ];
         let mut conn = HttpConnection::new(HttpScheme::Http);
         let mut session = TestSession::new_verify(vec![expected_headers],
@@ -957,6 +1097,10 @@ mod tests {
         conn.handle_next_frame(&mut frame_provider, &mut session).unwrap();
         conn.handle_next_frame(&mut frame_provider, &mut session).unwrap();
         assert_eq!(conn.in_window_size(), 65_535 - 4);
+        assert_eq!(session.conn_in_window_decreases, vec![65_535, 65_535 - 4]);
+        assert_eq!(session.stream_window_decreases.len(), 2);
+        assert_eq!(session.stream_window_decreases[0], (1, 0));
+        assert_eq!(session.stream_window_decreases[1], (1, 4));
 
         // Two chunks and one header processed?
         assert_eq!(session.curr_chunk, 2);
@@ -995,6 +1139,48 @@ mod tests {
 
         assert_eq!(session.goaways.len(), 1);
         assert_eq!(session.goaways[0], ErrorCode::ProtocolError);
+        assert_eq!(session.curr_header, 0);
+        assert_eq!(session.curr_chunk, 0);
+        assert_eq!(session.rst_streams.len(), 0);
+    }
+
+    #[test]
+    fn test_conn_window_update() {
+        let frames = vec![
+            HttpFrame::WindowUpdateFrame(WindowUpdateFrame::for_connection(100)),
+        ];
+        let mut conn = HttpConnection::new(HttpScheme::Http);
+        let mut session = TestSession::new();
+        let mut frame_provider = MockReceiveFrame::new(frames);
+
+        conn.handle_next_frame(&mut frame_provider, &mut session).unwrap();
+
+        assert_eq!(session.conn_window_updates.len(), 1);
+        assert_eq!(session.conn_window_updates[0], 0xffff + 100);
+        // Nothing happened with the rest...
+        assert_eq!(session.stream_window_updates.len(), 0);
+        assert_eq!(session.goaways.len(), 0);
+        assert_eq!(session.curr_header, 0);
+        assert_eq!(session.curr_chunk, 0);
+        assert_eq!(session.rst_streams.len(), 0);
+    }
+
+    #[test]
+    fn test_conn_stream_window_update() {
+        let frames = vec![
+            HttpFrame::WindowUpdateFrame(WindowUpdateFrame::for_stream(1, 100)),
+        ];
+        let mut conn = HttpConnection::new(HttpScheme::Http);
+        let mut session = TestSession::new();
+        let mut frame_provider = MockReceiveFrame::new(frames);
+
+        conn.handle_next_frame(&mut frame_provider, &mut session).unwrap();
+
+        assert_eq!(session.stream_window_updates.len(), 1);
+        assert_eq!(session.stream_window_updates[0], (1, 100));
+        // Nothing happened with the rest...
+        assert_eq!(session.conn_window_updates.len(), 0);
+        assert_eq!(session.goaways.len(), 0);
         assert_eq!(session.curr_header, 0);
         assert_eq!(session.curr_chunk, 0);
         assert_eq!(session.rst_streams.len(), 0);

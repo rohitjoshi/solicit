@@ -9,7 +9,8 @@ use std::error::Error;
 use std::io::Read;
 use std::io::Cursor;
 use std::iter::FromIterator;
-use http::{StreamId, OwnedHeader, Header, HttpResult, ErrorCode, HttpError, ConnectionError};
+use http::{StreamId, OwnedHeader, Header, HttpResult, ErrorCode, HttpError, ConnectionError,
+           DEFAULT_MAX_WINDOW_SIZE, WindowSize};
 use http::frame::{HttpSetting, PingFrame};
 use http::connection::HttpConnection;
 
@@ -78,23 +79,96 @@ pub trait Session {
             debug_data: debug_data.map(|data| data.to_vec()),
         }))
     }
+
+    /// Notifies the `Session` that the connection's outbound flow control window was updated.
+    ///
+    /// The default implementation of the method ignores any change.
+    ///
+    /// Concrete implementations can rely on this to, for example, trigger more writes on a
+    /// connection that was previously blocked on flow control (rather than on socket IO).
+    fn on_connection_out_window_update(&mut self, _conn: &mut HttpConnection) -> HttpResult<()> {
+        Ok(())
+    }
+
+    /// Notifies the `Session` that the given stream's outbound flow control window should be
+    /// updated. Unlike the `on_connection_out_window_update`, the new size is not provided, but
+    /// rather the size of the increment. This is due to the fact that the `HttpConnection` does
+    /// not handle individual streams, but expects the session layer to be in charge of that.
+    ///
+    /// The default implementation of the method ignores any change.
+    fn on_stream_out_window_update(&mut self,
+                                   _stream_id: StreamId,
+                                   _increment: u32,
+                                   _conn: &mut HttpConnection)
+                                   -> HttpResult<()> {
+        Ok(())
+    }
+
+    /// Notifies the `Session` that the connection-level inbound flow control window has decreased.
+    /// The new value can be obtained from the given `HttpConnection` instance.
+    fn on_connection_in_window_decrease(&mut self, _conn: &mut HttpConnection) -> HttpResult<()> {
+        Ok(())
+    }
+
+    /// Notifies the `Session` that the given stream's inbound flow control window has decreased by
+    /// the given number of octets.
+    fn on_stream_in_window_decrease(
+            &mut self,
+            _stream_id: StreamId,
+            _size: u32,
+            _conn: &mut HttpConnection)
+            -> HttpResult<()> {
+        Ok(())
+    }
 }
 
 /// A newtype for an iterator over `Stream`s saved in a `SessionState`.
 ///
 /// Allows `SessionState` implementations to return iterators over its session without being forced
 /// to declare them as associated types.
-pub struct StreamIter<'a, S: Stream + 'a>(Box<Iterator<Item = (&'a StreamId, &'a mut S)> + 'a>);
+pub struct StreamIter<'a, S: Stream + 'a>(Box<Iterator<Item=(&'a StreamId, &'a mut Entry<S>)> + 'a>);
 
 impl<'a, S> Iterator for StreamIter<'a, S>
     where S: Stream + 'a
 {
-    type Item = (&'a StreamId, &'a mut S);
+    type Item = (&'a StreamId, &'a mut Entry<S>);
 
     #[inline]
-    fn next(&mut self) -> Option<(&'a StreamId, &'a mut S)> {
+    fn next(&mut self) -> Option<(&'a StreamId, &'a mut Entry<S>)> {
         self.0.next()
     }
+}
+
+/// A struct representing a single entry in the `SessionState`. The `Entry` represents all relevant
+/// information for a single HTTP/2 stream.
+pub struct Entry<S> where S: Stream {
+    stream: S,
+    /// Tracks the size of the outbound flow control window
+    out_window: WindowSize,
+    /// Tracks the size of the inbound flow control window
+    in_window: WindowSize,
+}
+
+impl<S> Entry<S> where S: Stream {
+    /// Create a new `Entry` with the given `Stream`
+    pub fn new(stream: S) -> Entry<S> {
+        Entry {
+            stream: stream,
+            // TODO: Use the current initial window sizes indicated by the connection settings!
+            out_window: DEFAULT_MAX_WINDOW_SIZE,
+            in_window: DEFAULT_MAX_WINDOW_SIZE,
+        }
+    }
+    /// Consumes the `Entry`, returning the underlying `Stream` instance
+    pub fn stream(self) -> S { self.stream }
+    /// Returns a reference to the `Stream`
+    pub fn stream_ref(&self) -> &S { &self.stream }
+    /// Returns a mutable reference to the `Stream`
+    pub fn stream_mut(&mut self) -> &mut S { &mut self.stream }
+
+    pub fn outbound_window(&self) -> &WindowSize { &self.out_window }
+    pub fn inbound_window(&self) -> &WindowSize { &self.in_window }
+    pub fn inbound_window_mut(&mut self) -> &mut WindowSize { &mut self.in_window }
 }
 
 /// A trait defining a set of methods for accessing and influencing an HTTP/2 session's state.
@@ -118,15 +192,13 @@ pub trait SessionState {
     /// stream.
     /// TODO(mlalic): Allow the exact error to propagate out.
     fn insert_incoming(&mut self, id: StreamId, stream: Self::Stream) -> Result<(), ()>;
-    /// Returns a reference to a `Stream` with the given `StreamId`, if it is found in the current
-    /// session.
-    fn get_stream_ref(&self, stream_id: StreamId) -> Option<&Self::Stream>;
-    /// Returns a mutable reference to a `Stream` with the given `StreamId`, if it is found in the
-    /// current session.
-    fn get_stream_mut(&mut self, stream_id: StreamId) -> Option<&mut Self::Stream>;
+    /// Returns a reference to the `Entry` for the stream with the given id.
+    fn get_entry_ref(&self, id: StreamId) -> Option<&Entry<Self::Stream>>;
+    /// Returns a mutable reference to the `Entry` for the stream with the given id.
+    fn get_entry_mut(&mut self, id: StreamId) -> Option<&mut Entry<Self::Stream>>;
     /// Removes the stream with the given `StreamId` from the session. If the stream was found in
     /// the session, it is returned in the result.
-    fn remove_stream(&mut self, stream_id: StreamId) -> Option<Self::Stream>;
+    fn remove_stream(&mut self, stream_id: StreamId) -> Option<Entry<Self::Stream>>;
 
     /// Returns an iterator over the streams currently found in the session.
     fn iter(&mut self) -> StreamIter<Self::Stream>;
@@ -134,22 +206,33 @@ pub trait SessionState {
     /// The number of streams tracked by this state object
     fn len(&self) -> usize;
 
+    /// Returns a reference to a `Stream` with the given `StreamId`, if it is found in the current
+    /// session.
+    fn get_stream_ref(&self, stream_id: StreamId) -> Option<&Self::Stream> {
+        self.get_entry_ref(stream_id).map(|e| e.stream_ref())
+    }
+
+    /// Returns a mutable reference to a `Stream` with the given `StreamId`, if it is found in the
+    /// current session.
+    fn get_stream_mut(&mut self, stream_id: StreamId) -> Option<&mut Self::Stream> {
+        self.get_entry_mut(stream_id).map(|e| e.stream_mut())
+    }
+
     /// Returns all streams that are closed and tracked by the session state.
     ///
     /// The streams are moved out of the session state.
     ///
     /// The default implementations relies on the `iter` implementation to find the closed streams
     /// first and then calls `remove_stream` on all of them.
-    fn get_closed(&mut self) -> Vec<Self::Stream> {
+    fn get_closed(&mut self) -> Vec<Entry<Self::Stream>> {
         let ids: Vec<StreamId> = self.iter()
-                                     .filter_map(|(id, s)| {
-                                         if s.is_closed() {
+                                     .filter_map(|(id, e)| {
+                                         if e.stream_ref().is_closed() {
                                              Some(*id)
                                          } else {
                                              None
                                          }
-                                     })
-                                     .collect();
+                                     }).collect();
         FromIterator::from_iter(ids.into_iter().map(|i| self.remove_stream(i).unwrap()))
     }
 }
@@ -188,7 +271,7 @@ pub struct DefaultSessionState<T, S>
     where S: Stream
 {
     /// All streams that the session state is currently aware of.
-    streams: HashMap<StreamId, S>,
+    streams: HashMap<StreamId, Entry<S>>,
     /// The next available ID for outgoing streams.
     next_stream_id: StreamId,
     /// The parity bit for outgoing connections. Client-initiated connections must always be
@@ -260,7 +343,7 @@ impl<T, S> SessionState for DefaultSessionState<T, S>
 
     fn insert_outgoing(&mut self, stream: Self::Stream) -> StreamId {
         let id = self.next_stream_id;
-        self.streams.insert(id, stream);
+        self.streams.insert(id, Entry::new(stream));
         self.next_stream_id += 2;
         id
     }
@@ -268,24 +351,23 @@ impl<T, S> SessionState for DefaultSessionState<T, S>
     fn insert_incoming(&mut self, stream_id: StreamId, stream: Self::Stream) -> Result<(), ()> {
         if self.validate_incoming_parity(stream_id) {
             // TODO(mlalic): Assert that the stream IDs are monotonically increasing!
-            self.streams.insert(stream_id, stream);
+            self.streams.insert(stream_id, Entry::new(stream));
             Ok(())
         } else {
             Err(())
         }
     }
 
-    #[inline]
-    fn get_stream_ref(&self, stream_id: StreamId) -> Option<&Self::Stream> {
+    fn get_entry_ref(&self, stream_id: StreamId) -> Option<&Entry<Self::Stream>> {
         self.streams.get(&stream_id)
     }
-    #[inline]
-    fn get_stream_mut(&mut self, stream_id: StreamId) -> Option<&mut Self::Stream> {
+
+    fn get_entry_mut(&mut self, stream_id: StreamId) -> Option<&mut Entry<Self::Stream>> {
         self.streams.get_mut(&stream_id)
     }
 
     #[inline]
-    fn remove_stream(&mut self, stream_id: StreamId) -> Option<Self::Stream> {
+    fn remove_stream(&mut self, stream_id: StreamId) -> Option<Entry<Self::Stream>> {
         self.streams.remove(&stream_id)
     }
 
@@ -355,9 +437,11 @@ pub enum StreamDataChunk {
 pub trait Stream {
     /// Handle a new data chunk that has arrived for the stream.
     fn new_data_chunk(&mut self, data: &[u8]);
+
     /// Set headers for a stream. A stream is only allowed to have one set of
     /// headers.
     fn set_headers<'n, 'v>(&mut self, headers: Vec<Header<'n, 'v>>);
+
     /// Sets the stream state to the newly provided state.
     fn set_state(&mut self, state: StreamState);
 
@@ -367,6 +451,14 @@ pub trait Stream {
     /// The default implementation simply closes the stream, discarding the provided error_code.
     /// Concrete `Stream` implementations can override this.
     fn on_rst_stream(&mut self, _error_code: ErrorCode) {
+        self.close();
+    }
+
+    /// Notifies the `Stream` that a stream error has been detected. This differs from
+    /// `on_rst_stream` in that the error was detected by the local peer, rather than the remote.
+    ///
+    /// The default implementation simply closes the stream.
+    fn on_stream_error(&mut self, _error_code: ErrorCode) {
         self.close();
     }
 
@@ -393,6 +485,7 @@ pub trait Stream {
     fn close(&mut self) {
         self.set_state(StreamState::Closed);
     }
+
     /// Updates the `Stream` status to indicate that it is closed locally.
     ///
     /// If the stream is closed on the remote end, then it is fully closed after this call.
@@ -403,6 +496,7 @@ pub trait Stream {
         };
         self.set_state(next);
     }
+
     /// Updates the `Stream` status to indicate that it is closed on the remote peer's side.
     ///
     /// If the stream is also locally closed, then it is fully closed after this call.
@@ -413,12 +507,14 @@ pub trait Stream {
         };
         self.set_state(next);
     }
+
     /// Returns whether the stream is closed.
     ///
     /// A stream is considered to be closed iff its state is set to `Closed`.
     fn is_closed(&self) -> bool {
         self.state() == StreamState::Closed
     }
+
     /// Returns whether the stream is closed locally.
     fn is_closed_local(&self) -> bool {
         match self.state() {
@@ -426,6 +522,7 @@ pub trait Stream {
             _ => false,
         }
     }
+
     /// Returns whether the remote peer has closed the stream. This includes a fully closed stream.
     fn is_closed_remote(&self) -> bool {
         match self.state() {
@@ -542,7 +639,7 @@ impl Stream for DefaultStream {
 #[cfg(test)]
 mod tests {
     use super::{Stream, DefaultSessionState, DefaultStream, StreamDataChunk, StreamDataError,
-                SessionState, Parity};
+                SessionState, Parity, StreamState};
     use super::Client as ClientMarker;
     use super::Server as ServerMarker;
     use http::{ErrorCode, Header};
@@ -754,6 +851,14 @@ mod tests {
             Err(StreamDataError::Closed) => true,
             _ => false,
         });
+    }
+
+    /// Tests that when the `DefaultStream` receives an error, it closes the stream.
+    #[test]
+    fn test_default_stream_on_error() {
+        let mut stream = DefaultStream::new();
+        stream.on_stream_error(ErrorCode::FlowControlError);
+        assert_eq!(stream.state(), StreamState::Closed);
     }
 
     #[test]

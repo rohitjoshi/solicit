@@ -13,6 +13,7 @@ pub mod transport;
 pub mod connection;
 pub mod session;
 pub mod priority;
+pub mod flow_control;
 
 pub mod client;
 pub mod server;
@@ -522,6 +523,7 @@ impl WindowSize {
     pub fn new(size: i32) -> WindowSize {
         WindowSize(size)
     }
+
     /// Returns the current size of the window.
     ///
     /// The size is actually allowed to become negative (for instance if the peer changes its
@@ -529,7 +531,36 @@ impl WindowSize {
     pub fn size(&self) -> i32 {
         self.0
     }
+
+    /// Checks whether the window is large enough to accept the given number of bytes.
+    /// If this method returns `true`, it is guaranteed that `try_decrease` must succeed.
+    ///
+    /// ```rust
+    /// use solicit::http::WindowSize;
+    ///
+    /// let window = WindowSize::new(1000);
+    /// assert!(window.can_accept(5));
+    /// assert!(window.can_accept(1000));
+    /// assert!(!window.can_accept(1001));
+    /// ```
+    pub fn can_accept(&self, size: i32) -> bool {
+        self.0 >= size
+    }
 }
+
+impl Into<i32> for WindowSize {
+    fn into(self) -> i32 {
+        self.size()
+    }
+}
+
+impl PartialEq<i32> for WindowSize {
+    fn eq(&self, rhs: &i32) -> bool {
+        self.size() == *rhs
+    }
+}
+
+pub const DEFAULT_MAX_WINDOW_SIZE: WindowSize = WindowSize(0xffff);
 
 /// An enum representing the two possible HTTP schemes.
 #[derive(Debug, Copy, Clone, PartialEq)]
